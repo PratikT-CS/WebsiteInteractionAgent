@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 from typing import Dict, Any, Union, Optional, List
 import os
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.managed import IsLastStep, RemainingSteps
@@ -12,7 +12,8 @@ import json
 import dotenv
 import asyncio
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
+from collections import defaultdict, deque
 
 dotenv.load_dotenv()
 
@@ -74,6 +75,110 @@ manager = ConnectionManager()
 
 # Store current client ID for tool execution
 current_client_id = None
+
+# Memory Management System
+class MemoryManager:
+    def __init__(self, max_messages_per_session: int = 20, session_timeout_hours: int = 1):
+        """
+        Initialize memory manager for storing conversation history.
+        
+        Args:
+            max_messages_per_session: Maximum number of messages to keep per session
+            session_timeout_hours: Hours after which a session expires
+        """
+        self.max_messages_per_session = max_messages_per_session
+        self.session_timeout_hours = session_timeout_hours
+        self.sessions: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
+            'messages': deque(maxlen=max_messages_per_session),
+            'last_activity': datetime.now(),
+            'session_id': None
+        })
+    
+    def get_or_create_session(self, client_id: str) -> str:
+        """Get existing session or create new one for client."""
+        session_data = self.sessions[client_id]
+        
+        # Check if session has expired
+        if (datetime.now() - session_data['last_activity']).total_seconds() > (self.session_timeout_hours * 3600):
+            # Session expired, create new one
+            session_data['messages'].clear()
+            session_data['session_id'] = str(uuid.uuid4())
+        
+        # Create session ID if it doesn't exist
+        if not session_data['session_id']:
+            session_data['session_id'] = str(uuid.uuid4())
+        
+        # Update last activity
+        session_data['last_activity'] = datetime.now()
+        
+        return session_data['session_id']
+    
+    def add_message(self, client_id: str, message: Union[HumanMessage, AIMessage, SystemMessage]):
+        """Add a message to the client's conversation history."""
+        session_data = self.sessions[client_id]
+        session_data['messages'].append({
+            'type': message.__class__.__name__,
+            'content': message.content,
+            'timestamp': datetime.now().isoformat()
+        })
+        session_data['last_activity'] = datetime.now()
+    
+    def get_conversation_history(self, client_id: str) -> List[Union[HumanMessage, AIMessage, SystemMessage]]:
+        """Get conversation history for a client as LangChain messages."""
+        session_data = self.sessions[client_id]
+        messages = []
+        
+        for msg_data in session_data['messages']:
+            if msg_data['type'] == 'HumanMessage':
+                messages.append(HumanMessage(content=msg_data['content']))
+            elif msg_data['type'] == 'AIMessage':
+                messages.append(AIMessage(content=msg_data['content']))
+            elif msg_data['type'] == 'SystemMessage':
+                messages.append(SystemMessage(content=msg_data['content']))
+        
+        return messages
+    
+    def get_conversation_summary(self, client_id: str) -> str:
+        """Get a brief summary of the conversation for context."""
+        session_data = self.sessions[client_id]
+        messages = list(session_data['messages'])
+        
+        if not messages:
+            return "No previous conversation history."
+        
+        # Get last few messages for context
+        recent_messages = messages[-6:] if len(messages) > 6 else messages
+        
+        summary_parts = []
+        for msg in recent_messages:
+            if msg['type'] == 'HumanMessage':
+                summary_parts.append(f"User: {msg['content'][:100]}...")
+            elif msg['type'] == 'AIMessage':
+                summary_parts.append(f"Assistant: {msg['content'][:100]}...")
+        
+        return "Recent conversation:\n" + "\n".join(summary_parts)
+    
+    def clear_session(self, client_id: str):
+        """Clear conversation history for a client."""
+        if client_id in self.sessions:
+            self.sessions[client_id]['messages'].clear()
+            self.sessions[client_id]['session_id'] = str(uuid.uuid4())
+    
+    def cleanup_expired_sessions(self):
+        """Remove expired sessions to free memory."""
+        current_time = datetime.now()
+        expired_clients = []
+        
+        for client_id, session_data in self.sessions.items():
+            if (current_time - session_data['last_activity']).total_seconds() > (self.session_timeout_hours * 3600):
+                expired_clients.append(client_id)
+        
+        for client_id in expired_clients:
+            del self.sessions[client_id]
+            print(f"Cleaned up expired session for client: {client_id}")
+
+# Global memory manager
+memory_manager = MemoryManager()
 
 # Request/Response models
 class AgentRequest(BaseModel):
@@ -237,7 +342,7 @@ except Exception as e:
 
 @app.post("/agent", response_model=AgentResponse)
 async def agent_endpoint(request: AgentRequest):
-    """Process a query through the LangGraph ReAct agent."""
+    """Process a query through the LangGraph ReAct agent with memory."""
     global current_client_id
     
     try:
@@ -251,15 +356,29 @@ async def agent_endpoint(request: AgentRequest):
         # Set the current client ID for tool execution
         if request.client_id:
             current_client_id = request.client_id
+            # Get or create session for this client
+            session_id = memory_manager.get_or_create_session(request.client_id)
+            print(f"Using session {session_id} for client {request.client_id}")
         
-        # Create initial state with the user's query
-        prompt = f"""You are a Website Interaction Agent that completes user requests by interacting with web pages.
+        # Get conversation history for context
+        conversation_history = []
+        conversation_summary = ""
+        
+        if request.client_id:
+            conversation_history = memory_manager.get_conversation_history(request.client_id)
+            conversation_summary = memory_manager.get_conversation_summary(request.client_id)
+        
+        # Create system message with memory context
+        system_prompt = f"""You are a Website Interaction Agent that completes user requests by interacting with web pages.
 
 ### CRITICAL RULES
 1. ALWAYS complete the user's ENTIRE request - never stop midway
 2. Execute ALL necessary steps parallelly until you fill this steps need sequencial execution.
 3. For form submissions: fill ALL fields AND click submit - this is ONE complete task
 4. Only use "Final Answer" after ALL steps are complete and verified
+5. REMEMBER previous conversations and use that context to provide better responses
+
+
 
 ### Contact Form Workflow
 When filling and submitting a contact form, you MUST do ALL these steps:
@@ -285,19 +404,36 @@ Step 6: Call click_element with "#agent-submit"
 Step 7: Final Response with tool execution summary
 
 IMPORTANT: Do not stop until ALL steps are complete!
-User query: {request.query}
 """
         
+        # Build messages list with conversation history and current query
+        messages = [SystemMessage(content=system_prompt)]
+        
+        # Add conversation history (excluding system messages to avoid duplication)
+        for msg in conversation_history:
+            if not isinstance(msg, SystemMessage):
+                messages.append(msg)
+        
+        # Add current user query
+        messages.append(HumanMessage(content=request.query))
+        
         initial_state = {
-            "messages": [HumanMessage(content=prompt)]
+            "messages": messages
         }
         
-        # Run the ReAct agent with recursion limit
+        # Run the ReAct agent with memory context
         result = agent.invoke(initial_state)
         
         # Get the last message from the result
         last_message = result["messages"][-1]
         print("Agent response:", last_message.content)
+        
+        # Store the conversation in memory
+        if request.client_id:
+            # Add user message to memory
+            memory_manager.add_message(request.client_id, HumanMessage(content=request.query))
+            # Add AI response to memory
+            memory_manager.add_message(request.client_id, AIMessage(content=last_message.content))
         
         # Process any queued tools for the current client
         if current_client_id:
@@ -337,6 +473,45 @@ async def root():
 async def health():
     """Health check endpoint for testing."""
     return {"status": "healthy", "message": "Backend is running"}
+
+class ClearMemoryRequest(BaseModel):
+    client_id: str
+
+@app.post("/memory/clear")
+async def clear_memory(request: ClearMemoryRequest):
+    """Clear conversation memory for a specific client."""
+    memory_manager.clear_session(request.client_id)
+    return {"message": f"Memory cleared for client {request.client_id}"}
+
+@app.get("/memory/summary/{client_id}")
+async def get_memory_summary(client_id: str):
+    """Get conversation summary for a specific client."""
+    summary = memory_manager.get_conversation_summary(client_id)
+    return {"client_id": client_id, "summary": summary}
+
+@app.post("/memory/cleanup")
+async def cleanup_memory():
+    """Manually trigger cleanup of expired sessions."""
+    memory_manager.cleanup_expired_sessions()
+    return {"message": "Memory cleanup completed"}
+
+# Background task for memory cleanup
+async def periodic_memory_cleanup():
+    """Periodically clean up expired sessions."""
+    while True:
+        try:
+            await asyncio.sleep(3600)  # Run every hour
+            memory_manager.cleanup_expired_sessions()
+            print("Periodic memory cleanup completed")
+        except Exception as e:
+            print(f"Error in periodic memory cleanup: {e}")
+
+# Start background task when the app starts
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks on app startup."""
+    asyncio.create_task(periodic_memory_cleanup())
+    print("Background memory cleanup task started")
 
 if __name__ == "__main__":
     import uvicorn

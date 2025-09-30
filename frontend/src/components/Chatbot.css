@@ -790,7 +790,7 @@
   line-height: 1.4;
   resize: none;
   outline: none;
-  min-height: 20px;
+  min-height: 25px;
   max-height: 100px;
   font-family: inherit;
 }

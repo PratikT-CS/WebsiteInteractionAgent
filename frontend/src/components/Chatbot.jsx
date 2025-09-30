@@ -202,6 +202,10 @@ const Chatbot = () => {
   // Chat interface state
   const [interfaceMode, setInterfaceMode] = useState("voice"); // 'voice' | 'chat'
 
+  // Memory management state
+  const [memoryEnabled, setMemoryEnabled] = useState(true);
+  const [conversationHistory, setConversationHistory] = useState([]);
+
   // Speech API refs
   const recognitionRef = useRef(null);
   const synthesisRef = useRef(null);
@@ -233,6 +237,64 @@ const Chatbot = () => {
     if (!navigate) return null;
     return createToolRegistry(navigate, wsConnection);
   }, [navigate, wsConnection]);
+
+  // Memory management functions
+  const clearMemory = async () => {
+    try {
+      const response = await fetch("http://127.0.0.1:8000/memory/clear", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          client_id: clientId,
+        }),
+      });
+
+      if (response.ok) {
+        console.log("Memory cleared successfully");
+        // Reset conversation history in frontend
+        setConversationHistory([]);
+        setMessages([
+          {
+            id: 1,
+            text: "Hello! I'm your AI assistant here to help you to interact with our website. How can I help you today?",
+            sender: "ai",
+            timestamp: new Date(),
+          },
+        ]);
+      } else {
+        console.error("Failed to clear memory");
+      }
+    } catch (error) {
+      console.error("Error clearing memory:", error);
+    }
+  };
+
+  const getMemorySummary = async () => {
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8000/memory/summary/${clientId}`
+      );
+      if (response.ok) {
+        const data = await response.json();
+        console.log("Memory summary:", data.summary);
+        return data.summary;
+      }
+    } catch (error) {
+      console.error("Error getting memory summary:", error);
+    }
+    return null;
+  };
+
+  const toggleMemory = () => {
+    setMemoryEnabled(!memoryEnabled);
+    if (!memoryEnabled) {
+      console.log("Memory enabled");
+    } else {
+      console.log("Memory disabled");
+    }
+  };
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -378,7 +440,7 @@ const Chatbot = () => {
           },
           body: JSON.stringify({
             query: messageText,
-            client_id: clientId,
+            client_id: memoryEnabled ? clientId : null, // Only send client_id if memory is enabled
           }),
         });
 
@@ -1187,7 +1249,7 @@ const Chatbot = () => {
         },
         body: JSON.stringify({
           query: currentInput,
-          client_id: clientId,
+          client_id: memoryEnabled ? clientId : null, // Only send client_id if memory is enabled
         }),
       });
 
@@ -1431,10 +1493,41 @@ const Chatbot = () => {
               ></div>
               <span className="status-text">
                 {isConnected ? "Connected" : "Offline"}
+                {/* {memoryEnabled && " • Memory"} */}
               </span>
             </div>
 
             <div className="header-controls">
+              {/* <button
+                className={`setting-btn ${memoryEnabled ? "active" : ""}`}
+                onClick={toggleMemory}
+                title={memoryEnabled ? "Disable memory" : "Enable memory"}
+              >
+                <svg
+                  width="18"
+                  height="18"
+                  viewBox="0 0 24 24"
+                  fill="currentColor"
+                >
+                  <path d="M15,7V9H12V11H15V13H12V15H15V17H9V7H15M5,3H19A2,2 0 0,1 21,5V19A2,2 0 0,1 19,21H5A2,2 0 0,1 3,19V5A2,2 0 0,1 5,3M5,5V19H19V5H5Z" />
+                </svg>
+              </button> */}
+
+              {/* <button
+                className="setting-btn"
+                onClick={clearMemory}
+                title="Clear conversation memory"
+              >
+                <svg
+                  width="18"
+                  height="18"
+                  viewBox="0 0 24 24"
+                  fill="currentColor"
+                >
+                  <path d="M19,4H15.5L14.5,3H9.5L8.5,4H5V6H19M6,19A2,2 0 0,0 8,21H16A2,2 0 0,0 18,19V7H6V19Z" />
+                </svg>
+              </button> */}
+
               <button
                 className={`setting-btn ${autoSpeak ? "active" : ""}`}
                 onClick={toggleAutoSpeak}
