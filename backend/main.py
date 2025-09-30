@@ -271,6 +271,7 @@ When filling and submitting a contact form, you MUST do ALL these steps:
 6. Click submit button
 7. Verify success
 8. Only then respond with completion message
+If any field is not provide by user ask for it and then fill it and then submit the form.
 
 ### Example Workflow
 User: "Fill contact form with John Doe, john@example.com, 'Hello'"
