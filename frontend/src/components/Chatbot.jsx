@@ -796,16 +796,8 @@ const Chatbot = () => {
       "Hello! I'm your AI assistant here to help you to interact with our website. How can I help you today?";
     console.log("🎤 Speaking welcome message");
 
-    // Add welcome message to conversation history
-    const welcomeMsg = {
-      id: messages.length + 1,
-      text: welcomeMessage,
-      sender: "ai",
-      timestamp: new Date(),
-    };
-    setMessages((prev) => [...prev, welcomeMsg]);
-
-    // Speak the welcome message with custom onend callback
+    // Don't add welcome message to conversation history since it's already in the initial state
+    // Just speak the welcome message with custom onend callback
     if (speechSupported && synthesisRef.current && autoSpeak) {
       // Stop any current speech
       synthesisRef.current.cancel();
@@ -871,7 +863,7 @@ const Chatbot = () => {
       // If speech not supported, just set hasWelcomed to true
       setHasWelcomed(true);
     }
-  }, [messages.length, speechSupported, autoSpeak]);
+  }, [speechSupported, autoSpeak]);
 
   const startPhoneCallMode = useCallback(async () => {
     console.log("📞 Starting phone call mode");
