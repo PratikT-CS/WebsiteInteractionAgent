@@ -8,13 +8,24 @@ const WS_URL = "ws://127.0.0.1:8000/ws";
 
 // Voice Activity Detection Configuration
 const VAD_CONFIG = {
-  SILENCE_THRESHOLD: 0.01, // Minimum audio level to consider as speech
+  SILENCE_THRESHOLD: 0.04, // Minimum audio level to consider as speech
   SILENCE_DURATION: 1500, // Milliseconds of silence before considering speech ended
   MIN_SPEECH_DURATION: 500, // Minimum speech duration to process
   MAX_SPEECH_DURATION: 30000, // Maximum speech duration before timeout
   SAMPLE_RATE: 16000,
   BUFFER_SIZE: 4096,
+  INACTIVITY_TIMEOUT: 9000, // 9 seconds of inactivity before prompting user
+  MAX_PROMPT_ATTEMPTS: 2, // Maximum number of times to prompt user before pausing
 };
+
+// Random messages to prompt user when silence is detected
+const SILENCE_PROMPTS = [
+  "Are you still there?",
+  "Hello? Can you hear me?",
+  "I'm still here if you need any help.",
+  "Did you have any other questions?",
+  "Let me know if you need anything else.",
+];
 
 // Tool Registry - Safe, whitelisted functions
 const createToolRegistry = (navigate, wsConnection) => ({
@@ -191,13 +202,13 @@ const Chatbot = () => {
   const [conversationMode, setConversationMode] = useState("manual"); // 'manual' | 'continuous' | 'paused'
   const [isInConversation, setIsInConversation] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [voiceLevel, setVoiceLevel] = useState(0);
   const [isInterrupted, setIsInterrupted] = useState(false);
   const [hasGreeted, setHasGreeted] = useState(false);
   const [isWaitingForSpeech, setIsWaitingForSpeech] = useState(false);
   const [hasWelcomed, setHasWelcomed] = useState(false);
   const [silenceTimer, setSilenceTimer] = useState(null);
   const [silenceAttempts, setSilenceAttempts] = useState(0);
+  const [voiceState, setVoiceState] = useState("ready"); // 'idle' | 'ready' | 'listening' | 'speaking' | 'processing'
 
   // Chat interface state
   const [interfaceMode, setInterfaceMode] = useState("voice"); // 'voice' | 'chat'
@@ -221,6 +232,8 @@ const Chatbot = () => {
   const isSpeechActiveRef = useRef(false);
   const speechQueueRef = useRef([]);
   const continuousModeRef = useRef(false);
+  const isListeningRef = useRef(false);
+  const isSpeakingRef = useRef(false);
 
   // Conversation flow refs
   const silenceTimeoutRef = useRef(null);
@@ -231,6 +244,8 @@ const Chatbot = () => {
   const stopConversationRef = useRef(null);
   const safeStartRecognitionRef = useRef(null);
   const handleSilenceTimeoutRef = useRef(null);
+  const pauseConversationRef = useRef(null);
+  const silenceAttemptsRef = useRef(0);
 
   // Create tool registry with navigate function
   const toolRegistry = React.useMemo(() => {
@@ -300,116 +315,8 @@ const Chatbot = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
 
-  // Voice Activity Detection Functions
-  const initializeAudioContext = useCallback(async () => {
-    try {
-      if (!audioContextRef.current) {
-        audioContextRef.current = new (window.AudioContext ||
-          window.webkitAudioContext)();
-      }
-
-      if (audioContextRef.current.state === "suspended") {
-        await audioContextRef.current.resume();
-      }
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          sampleRate: VAD_CONFIG.SAMPLE_RATE,
-        },
-      });
-
-      microphoneRef.current = stream;
-      analyserRef.current = audioContextRef.current.createAnalyser();
-      analyserRef.current.fftSize = VAD_CONFIG.BUFFER_SIZE;
-      analyserRef.current.smoothingTimeConstant = 0.8;
-
-      const source = audioContextRef.current.createMediaStreamSource(stream);
-      source.connect(analyserRef.current);
-
-      console.log("🎤 Audio context initialized for VAD");
-      return true;
-    } catch (error) {
-      console.error("Failed to initialize audio context:", error);
-      return false;
-    }
-  }, []);
-
-  const monitorVoiceActivity = useCallback(() => {
-    if (!analyserRef.current || !continuousModeRef.current) return;
-
-    const bufferLength = analyserRef.current.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-
-    const checkAudioLevel = () => {
-      if (!analyserRef.current || !continuousModeRef.current) return;
-
-      analyserRef.current.getByteFrequencyData(dataArray);
-
-      // Calculate average audio level
-      let sum = 0;
-      for (let i = 0; i < bufferLength; i++) {
-        sum += dataArray[i];
-      }
-      const average = sum / bufferLength / 255; // Normalize to 0-1
-
-      setVoiceLevel(average);
-
-      const isCurrentlySpeaking = average > VAD_CONFIG.SILENCE_THRESHOLD;
-      const now = Date.now();
-
-      if (isCurrentlySpeaking && !isSpeechActiveRef.current) {
-        // Speech started - interrupt bot if it's speaking
-        if (isSpeaking && synthesisRef.current) {
-          console.log("🛑 Interrupting speech synthesis");
-          synthesisRef.current.cancel();
-          setIsSpeaking(false);
-          setIsInterrupted(true);
-          currentUtteranceRef.current = null;
-        }
-
-        isSpeechActiveRef.current = true;
-        speechStartTimeRef.current = now;
-        lastSpeechTimeRef.current = now;
-        console.log("🎤 Speech detected, starting VAD monitoring");
-
-        // Clear any existing timeout
-        if (vadTimeoutRef.current) {
-          clearTimeout(vadTimeoutRef.current);
-        }
-      } else if (isCurrentlySpeaking && isSpeechActiveRef.current) {
-        // Continue speaking
-        lastSpeechTimeRef.current = now;
-      } else if (!isCurrentlySpeaking && isSpeechActiveRef.current) {
-        // Check if speech has ended
-        const silenceDuration = now - lastSpeechTimeRef.current;
-
-        if (silenceDuration >= VAD_CONFIG.SILENCE_DURATION) {
-          const speechDuration =
-            lastSpeechTimeRef.current - speechStartTimeRef.current;
-
-          if (speechDuration >= VAD_CONFIG.MIN_SPEECH_DURATION) {
-            console.log("🎤 Speech ended, processing...");
-            isSpeechActiveRef.current = false;
-            // Clear silence timeout since we detected speech
-            if (silenceTimeoutRef.current) {
-              clearTimeout(silenceTimeoutRef.current);
-              silenceTimeoutRef.current = null;
-            }
-          } else {
-            console.log("🎤 Speech too short, ignoring");
-            isSpeechActiveRef.current = false;
-          }
-        }
-      }
-
-      requestAnimationFrame(checkAudioLevel);
-    };
-
-    checkAudioLevel();
-  }, [isSpeaking]);
+  // Voice Activity Detection is handled by browser's Speech Recognition API
+  // No need for custom VAD implementation
 
   const handleContinuousMessage = useCallback(
     async (messageText) => {
@@ -420,6 +327,18 @@ const Chatbot = () => {
         );
         return;
       }
+
+      // Clear any existing silence timer since we're processing
+      if (silenceTimer) {
+        console.log("🔕 Clearing silence timer - processing message");
+        clearTimeout(silenceTimer);
+        setSilenceTimer(null);
+      }
+
+      // Reset silence attempts when user speaks
+      console.log("🔄 Resetting silence attempts - user spoke");
+      silenceAttemptsRef.current = 0;
+      setSilenceAttempts(0);
 
       const userMessage = {
         id: messages.length + 1,
@@ -499,108 +418,178 @@ const Chatbot = () => {
         isProcessingTranscriptRef.current = false;
       }
     },
-    [messages.length, clientId, autoSpeak, hasWelcomed]
+    [messages.length, clientId, autoSpeak, hasWelcomed, silenceTimer]
   );
 
   // Store the function in a ref so it can be called from event handlers
   handleMessageRef.current = handleContinuousMessage;
 
-  // Function to handle silence timeout with two attempts
+  // Function to handle silence timeout with multiple attempts and random prompts
   const handleSilenceTimeout = useCallback(() => {
-    console.log("⏰ Silence timeout reached, attempt:", silenceAttempts + 1);
-    console.log("⏰ Current silenceAttempts state:", silenceAttempts);
+    const currentAttempt = silenceAttemptsRef.current;
+    console.log("⏰ Silence timeout reached, attempt:", currentAttempt + 1);
 
-    if (silenceAttempts === 0) {
-      // First attempt - ask "Are you still there?"
-      console.log("🔊 First silence timeout - asking if user is still there");
-      setSilenceAttempts(1);
+    if (currentAttempt < VAD_CONFIG.MAX_PROMPT_ATTEMPTS) {
+      // Pick a random prompt message
+      const randomPrompt =
+        SILENCE_PROMPTS[Math.floor(Math.random() * SILENCE_PROMPTS.length)];
+      console.log(
+        `🔊 Attempt ${currentAttempt + 1}/${
+          VAD_CONFIG.MAX_PROMPT_ATTEMPTS
+        } - Asking: "${randomPrompt}"`
+      );
 
-      if (speakTextRef.current) {
-        // Create a custom utterance for the "Are you still there?" message
-        if (speechSupported && synthesisRef.current) {
-          synthesisRef.current.cancel();
+      // Increment attempts using ref
+      silenceAttemptsRef.current = currentAttempt + 1;
+      setSilenceAttempts(currentAttempt + 1);
 
-          const utterance = new SpeechSynthesisUtterance(
-            "Are you still there?"
+      if (speechSupported && synthesisRef.current) {
+        synthesisRef.current.cancel();
+
+        const utterance = new SpeechSynthesisUtterance(randomPrompt);
+        utterance.rate = 0.9;
+        utterance.pitch = 1.0;
+        utterance.volume = 0.8;
+
+        utterance.onstart = () => {
+          console.log(`🔊 Prompt "${randomPrompt}" started`);
+          setIsSpeaking(true);
+          isSpeakingRef.current = true;
+          setVoiceState("speaking");
+        };
+
+        utterance.onend = () => {
+          console.log(
+            `🔊 Prompt "${randomPrompt}" ended - restarting recognition`
           );
-          utterance.rate = 0.9;
-          utterance.pitch = 1.0;
-          utterance.volume = 0.8;
+          setIsSpeaking(false);
+          isSpeakingRef.current = false;
 
-          utterance.onend = () => {
-            console.log(
-              "🔊 'Are you still there?' ended - restarting recognition"
-            );
-            // Restart recognition after the prompt
-            setTimeout(() => {
-              if (safeStartRecognitionRef.current) {
-                safeStartRecognitionRef.current();
-              }
-
-              // Set up another 5 second timeout
-              const timeoutId = setTimeout(() => {
-                if (recognitionRef.current && isListening) {
+          // Restart recognition after the prompt - don't show ready state in between
+          setTimeout(() => {
+            // Make sure recognition is stopped before starting
+            if (recognitionRef.current && continuousModeRef.current) {
+              try {
+                // Stop if it's running
+                if (isListeningRef.current) {
                   recognitionRef.current.stop();
                   setIsListening(false);
-                  if (handleSilenceTimeoutRef.current) {
-                    handleSilenceTimeoutRef.current(); // This will now be the second attempt
-                  }
+                  isListeningRef.current = false;
                 }
-              }, 5000);
 
-              setSilenceTimer(timeoutId);
-            }, 500);
-          };
+                // Wait a bit for stop to complete, then start
+                setTimeout(() => {
+                  if (
+                    safeStartRecognitionRef.current &&
+                    continuousModeRef.current
+                  ) {
+                    safeStartRecognitionRef.current();
 
-          utterance.onerror = (event) => {
-            console.error("🔊 'Are you still there?' error:", event.error);
-            // Even if TTS fails, restart recognition
-            setTimeout(() => {
-              if (safeStartRecognitionRef.current) {
-                safeStartRecognitionRef.current();
+                    // Set up another 7 second timeout
+                    const timeoutId = setTimeout(() => {
+                      if (recognitionRef.current && isListeningRef.current) {
+                        recognitionRef.current.stop();
+                        setIsListening(false);
+                        isListeningRef.current = false;
+                        if (handleSilenceTimeoutRef.current) {
+                          handleSilenceTimeoutRef.current(); // Try next attempt
+                        }
+                      }
+                    }, VAD_CONFIG.INACTIVITY_TIMEOUT);
+
+                    setSilenceTimer(timeoutId);
+                  }
+                }, 100);
+              } catch (error) {
+                console.error(
+                  "Error managing recognition after prompt:",
+                  error
+                );
               }
-            }, 500);
-          };
+            }
+          }, 200);
+        };
 
-          synthesisRef.current.speak(utterance);
-        }
+        utterance.onerror = (event) => {
+          console.error(`🔊 Prompt "${randomPrompt}" error:`, event.error);
+          setIsSpeaking(false);
+          isSpeakingRef.current = false;
+          setVoiceState("ready");
+
+          // Even if TTS fails, restart recognition
+          setTimeout(() => {
+            if (safeStartRecognitionRef.current && continuousModeRef.current) {
+              safeStartRecognitionRef.current();
+            }
+          }, 500);
+        };
+
+        synthesisRef.current.speak(utterance);
       }
     } else {
-      // Second attempt - end conversation
-      console.log("🔊 Second silence timeout - ending conversation");
+      // Max attempts reached - speak hold message then pause conversation
+      console.log(
+        `🔊 Max attempts (${VAD_CONFIG.MAX_PROMPT_ATTEMPTS}) reached - putting call on hold`
+      );
+      silenceAttemptsRef.current = 0;
       setSilenceAttempts(0);
-      if (stopConversationRef.current) {
-        stopConversationRef.current();
+
+      // Speak "putting call on hold" message before pausing
+      if (speechSupported && synthesisRef.current) {
+        synthesisRef.current.cancel();
+
+        const holdMessage =
+          "Putting the call on hold. Press resume when you're ready to continue.";
+        const utterance = new SpeechSynthesisUtterance(holdMessage);
+        utterance.rate = 0.9;
+        utterance.pitch = 1.0;
+        utterance.volume = 0.8;
+
+        utterance.onstart = () => {
+          console.log("🔊 Hold message started");
+          setIsSpeaking(true);
+          isSpeakingRef.current = true;
+          setVoiceState("speaking");
+        };
+
+        utterance.onend = () => {
+          console.log("🔊 Hold message ended - pausing conversation");
+          setIsSpeaking(false);
+          isSpeakingRef.current = false;
+          setVoiceState("idle");
+
+          // Pause the conversation after speaking
+          if (pauseConversationRef.current) {
+            pauseConversationRef.current();
+          }
+        };
+
+        utterance.onerror = (event) => {
+          console.error("🔊 Hold message error:", event.error);
+          setIsSpeaking(false);
+          isSpeakingRef.current = false;
+          setVoiceState("idle");
+
+          // Pause anyway even if TTS fails
+          if (pauseConversationRef.current) {
+            pauseConversationRef.current();
+          }
+        };
+
+        synthesisRef.current.speak(utterance);
+      } else {
+        // If speech not supported, just pause
+        if (pauseConversationRef.current) {
+          pauseConversationRef.current();
+        }
       }
     }
-  }, [silenceAttempts, speechSupported]);
+  }, [speechSupported]);
 
   // Store the function in a ref so it can be called from event handlers
   handleSilenceTimeoutRef.current = handleSilenceTimeout;
 
   // Continuous conversation control functions
-  const startContinuousConversation = useCallback(async () => {
-    console.log("🎙️ Starting continuous conversation mode");
-
-    const audioInitialized = await initializeAudioContext();
-    if (!audioInitialized) {
-      setSpeechError("Failed to initialize microphone for continuous mode");
-      return;
-    }
-
-    setConversationMode("continuous");
-    setIsInConversation(true);
-    continuousModeRef.current = true;
-    setSpeechError(null);
-
-    // Start monitoring voice activity
-    monitorVoiceActivity();
-
-    // Start initial listening directly to avoid circular dependency
-    if (safeStartRecognitionRef.current) {
-      safeStartRecognitionRef.current();
-    }
-  }, [initializeAudioContext]);
 
   const stopContinuousConversation = useCallback(() => {
     console.log("🛑 Stopping continuous conversation mode");
@@ -609,6 +598,7 @@ const Chatbot = () => {
     setConversationMode("manual");
     setIsInConversation(false);
     setIsListening(false);
+    isListeningRef.current = false;
     setIsProcessing(false);
 
     // Stop speech recognition
@@ -621,19 +611,13 @@ const Chatbot = () => {
       synthesisRef.current.cancel();
     }
 
-    // Clear VAD timeout
-    if (vadTimeoutRef.current) {
-      clearTimeout(vadTimeoutRef.current);
+    // Clear any silence timers
+    if (silenceTimer) {
+      clearTimeout(silenceTimer);
     }
 
-    // Close audio context
-    if (microphoneRef.current) {
-      microphoneRef.current.getTracks().forEach((track) => track.stop());
-    }
-
-    setVoiceLevel(0);
     setCurrentTranscript("");
-  }, []);
+  }, [silenceTimer]);
 
   // Store the function in a ref so it can be called from event handlers
   stopConversationRef.current = stopContinuousConversation;
@@ -645,28 +629,36 @@ const Chatbot = () => {
     }
 
     try {
-      // Stop recognition first to avoid "already started" error
-      if (isListening) {
+      // Always stop first to avoid "already started" error
+      if (isListeningRef.current) {
+        console.log("🎤 Stopping existing recognition before starting new one");
         recognitionRef.current.stop();
-        // Wait a bit for the stop to complete
+        setIsListening(false);
+        isListeningRef.current = false;
+
+        // Wait for stop to complete before starting
         setTimeout(() => {
           try {
-            recognitionRef.current.start();
-            setIsListening(true);
+            if (recognitionRef.current && !isListeningRef.current) {
+              recognitionRef.current.start();
+              // State will be set by onstart handler
+            }
           } catch (error) {
             console.error("Error starting recognition after stop:", error);
           }
-        }, 100);
+        }, 300);
+        return true;
       } else {
+        // Not currently listening, safe to start
         recognitionRef.current.start();
-        setIsListening(true);
+        // State will be set by onstart handler
+        return true;
       }
-      return true;
     } catch (error) {
       console.error("Error starting speech recognition:", error);
       return false;
     }
-  }, [speechSupported, isListening]);
+  }, [speechSupported]);
 
   // Store the function in a ref so it can be called from event handlers
   safeStartRecognitionRef.current = safeStartRecognition;
@@ -676,6 +668,7 @@ const Chatbot = () => {
       setConversationMode("paused");
       continuousModeRef.current = false;
       setIsListening(false);
+      isListeningRef.current = false;
 
       if (recognitionRef.current) {
         recognitionRef.current.stop();
@@ -686,6 +679,9 @@ const Chatbot = () => {
       }
     }
   }, [conversationMode]);
+
+  // Store the function in a ref so it can be called from event handlers
+  pauseConversationRef.current = pauseConversation;
 
   const resumeConversation = useCallback(() => {
     if (conversationMode === "paused") {
@@ -732,12 +728,15 @@ const Chatbot = () => {
       utterance.onstart = () => {
         console.log("🔊 Speech synthesis started");
         setIsSpeaking(true);
+        isSpeakingRef.current = true;
+        setVoiceState("speaking");
         setIsInterrupted(false);
       };
 
       utterance.onend = () => {
         console.log("🔊 Speech synthesis ended");
         setIsSpeaking(false);
+        isSpeakingRef.current = false;
         currentUtteranceRef.current = null;
 
         // In continuous mode, restart listening after speaking
@@ -746,6 +745,7 @@ const Chatbot = () => {
           conversationMode === "continuous" &&
           hasWelcomed
         ) {
+          // Don't set ready state - go straight to listening to avoid flicker
           setTimeout(() => {
             if (
               continuousModeRef.current &&
@@ -756,27 +756,32 @@ const Chatbot = () => {
                 safeStartRecognitionRef.current &&
                 safeStartRecognitionRef.current()
               ) {
-                // Set up 5 second silence timeout
+                // Set up 7 second silence timeout
                 const timeoutId = setTimeout(() => {
-                  if (recognitionRef.current && isListening) {
+                  if (recognitionRef.current && isListeningRef.current) {
                     recognitionRef.current.stop();
                     setIsListening(false);
+                    isListeningRef.current = false;
                     if (handleSilenceTimeoutRef.current) {
                       handleSilenceTimeoutRef.current();
                     }
                   }
-                }, 5000);
+                }, VAD_CONFIG.INACTIVITY_TIMEOUT);
 
                 setSilenceTimer(timeoutId);
               }
             }
-          }, 500);
+          }, 200);
+        } else {
+          setVoiceState("idle");
         }
       };
 
       utterance.onerror = (event) => {
         console.error("🔊 Speech synthesis error:", event.error);
         setIsSpeaking(false);
+        isSpeakingRef.current = false;
+        setVoiceState("idle");
         currentUtteranceRef.current = null;
       };
 
@@ -824,36 +829,45 @@ const Chatbot = () => {
       utterance.onstart = () => {
         console.log("🔊 Welcome message started");
         setIsSpeaking(true);
+        isSpeakingRef.current = true;
+        setVoiceState("speaking");
       };
 
       utterance.onend = () => {
         console.log("🔊 Welcome message ended - starting recognition");
         setIsSpeaking(false);
+        isSpeakingRef.current = false;
         setHasWelcomed(true);
+        // Don't set ready state - go straight to listening
 
         // Start recognition after welcome message ends
-        if (
-          safeStartRecognitionRef.current &&
-          safeStartRecognitionRef.current()
-        ) {
-          // Set up 5 second silence timeout
-          const timeoutId = setTimeout(() => {
-            if (recognitionRef.current && isListening) {
-              recognitionRef.current.stop();
-              setIsListening(false);
-              if (handleSilenceTimeoutRef.current) {
-                handleSilenceTimeoutRef.current();
+        setTimeout(() => {
+          if (
+            safeStartRecognitionRef.current &&
+            safeStartRecognitionRef.current()
+          ) {
+            // Set up 7 second silence timeout
+            const timeoutId = setTimeout(() => {
+              if (recognitionRef.current && isListeningRef.current) {
+                recognitionRef.current.stop();
+                setIsListening(false);
+                isListeningRef.current = false;
+                if (handleSilenceTimeoutRef.current) {
+                  handleSilenceTimeoutRef.current();
+                }
               }
-            }
-          }, 5000);
+            }, VAD_CONFIG.INACTIVITY_TIMEOUT);
 
-          setSilenceTimer(timeoutId);
-        }
+            setSilenceTimer(timeoutId);
+          }
+        }, 200);
       };
 
       utterance.onerror = (event) => {
         console.error("🔊 Welcome message error:", event.error);
         setIsSpeaking(false);
+        isSpeakingRef.current = false;
+        setVoiceState("idle");
         setHasWelcomed(true);
       };
 
@@ -868,26 +882,20 @@ const Chatbot = () => {
   const startPhoneCallMode = useCallback(async () => {
     console.log("📞 Starting phone call mode");
 
-    // Initialize audio context for VAD
-    const audioInitialized = await initializeAudioContext();
-    if (!audioInitialized) {
-      setSpeechError("Failed to initialize microphone for continuous mode");
-      return;
-    }
+    // Clear any previous errors
+    setSpeechError(null);
 
     setConversationMode("continuous");
     setIsInConversation(true);
     continuousModeRef.current = true;
     setSpeechError(null);
     setHasWelcomed(false); // Reset welcome state
-    setSilenceAttempts(0); // Reset silence attempts
-
-    // Start monitoring voice activity
-    monitorVoiceActivity();
+    silenceAttemptsRef.current = 0; // Reset silence attempts
+    setSilenceAttempts(0);
 
     // Speak welcome message first
     speakWelcomeMessage();
-  }, [initializeAudioContext, speakWelcomeMessage]);
+  }, [speakWelcomeMessage]);
 
   useEffect(() => {
     scrollToBottom();
@@ -927,6 +935,8 @@ const Chatbot = () => {
         recognition.onstart = () => {
           console.log("🎤 Speech recognition started");
           setIsListening(true);
+          isListeningRef.current = true; // Update ref as well
+          setVoiceState("listening");
           setIsWaitingForSpeech(true);
           setSpeechError(null);
           setCurrentTranscript(""); // Clear previous transcript when starting
@@ -937,23 +947,48 @@ const Chatbot = () => {
             setSilenceTimer(null);
           }
 
-          // Set timeout for silence detection
-          console.log("⏰ Setting 5 second silence timeout");
-          const timeoutId = setTimeout(() => {
+          // Set timeout for silence detection - only if not processing or speaking
+          if (!isProcessingTranscriptRef.current && !isSpeakingRef.current) {
             console.log(
-              "⏰ 5 second timeout triggered, isListening:",
-              isListening
+              `⏰ Setting ${
+                VAD_CONFIG.INACTIVITY_TIMEOUT / 1000
+              } second silence timeout`
             );
-            if (recognitionRef.current && isListening) {
-              recognitionRef.current.stop();
-              setIsListening(false);
-              if (handleSilenceTimeoutRef.current) {
-                handleSilenceTimeoutRef.current();
+            const timeoutId = setTimeout(() => {
+              console.log(
+                `⏰ ${
+                  VAD_CONFIG.INACTIVITY_TIMEOUT / 1000
+                } second timeout triggered, isListening:`,
+                isListeningRef.current,
+                "isSpeaking:",
+                isSpeakingRef.current
+              );
+              // Only trigger silence timeout if we're listening and not processing/speaking
+              if (
+                recognitionRef.current &&
+                isListeningRef.current &&
+                !isProcessingTranscriptRef.current &&
+                !isSpeakingRef.current
+              ) {
+                recognitionRef.current.stop();
+                setIsListening(false);
+                isListeningRef.current = false;
+                if (handleSilenceTimeoutRef.current) {
+                  handleSilenceTimeoutRef.current();
+                }
+              } else {
+                console.log(
+                  "⏰ Silence timeout ignored - processing or speaking"
+                );
               }
-            }
-          }, 5000);
+            }, VAD_CONFIG.INACTIVITY_TIMEOUT);
 
-          setSilenceTimer(timeoutId);
+            setSilenceTimer(timeoutId);
+          } else {
+            console.log(
+              "⏰ Skipping silence timeout - already processing or speaking"
+            );
+          }
         };
 
         recognition.onresult = (event) => {
@@ -983,9 +1018,13 @@ const Chatbot = () => {
 
           // Clear silence timer and reset attempts when speech is detected
           if ((finalTranscript || interimTranscript) && silenceTimer) {
+            console.log(
+              "🔄 Clearing silence timer and resetting attempts - user speaking"
+            );
             clearTimeout(silenceTimer);
             setSilenceTimer(null);
-            setSilenceAttempts(0); // Reset silence attempts when user speaks
+            silenceAttemptsRef.current = 0; // Reset silence attempts when user speaks
+            setSilenceAttempts(0);
           }
 
           // Process final transcript with 1 second delay
@@ -1006,6 +1045,7 @@ const Chatbot = () => {
               // Stop listening while processing
               recognition.stop();
               setCurrentTranscript("");
+              setVoiceState("processing");
 
               // Clear any existing silence timer
               if (silenceTimer) {
@@ -1030,7 +1070,11 @@ const Chatbot = () => {
         recognition.onend = () => {
           console.log("🎤 Speech recognition ended");
           setIsListening(false);
+          isListeningRef.current = false;
           setIsWaitingForSpeech(false);
+
+          // Don't change state here - let other handlers manage state transitions
+          // This prevents flicker between states
 
           // Clear silence timeout
           if (silenceTimeoutRef.current) {
@@ -1047,6 +1091,7 @@ const Chatbot = () => {
         recognition.onerror = (event) => {
           console.error("🎤 Speech recognition error:", event.error);
           setIsListening(false);
+          isListeningRef.current = false;
           setCurrentTranscript("");
 
           let errorMessage = "Speech recognition error";
@@ -1373,6 +1418,8 @@ const Chatbot = () => {
       setCurrentTranscript(""); // Clear previous transcript when starting new recognition
       console.log("🎤 Starting speech recognition...");
       recognitionRef.current.start();
+      setIsListening(true);
+      isListeningRef.current = true;
     } catch (error) {
       console.error("Error starting speech recognition:", error);
       setSpeechError("Failed to start speech recognition");
@@ -1380,8 +1427,10 @@ const Chatbot = () => {
   };
 
   const stopListening = () => {
-    if (recognitionRef.current && isListening) {
+    if (recognitionRef.current && isListeningRef.current) {
       recognitionRef.current.stop();
+      setIsListening(false);
+      isListeningRef.current = false;
     }
   };
 
@@ -1389,6 +1438,7 @@ const Chatbot = () => {
     if (synthesisRef.current) {
       synthesisRef.current.cancel();
       setIsSpeaking(false);
+      isSpeakingRef.current = false;
       currentUtteranceRef.current = null;
     }
   }, []);
@@ -1436,7 +1486,7 @@ const Chatbot = () => {
   useEffect(() => {
     const handleFocus = () => {
       // Browser regained focus - speech recognition might need restart
-      if (isListening && recognitionRef.current) {
+      if (isListeningRef.current && recognitionRef.current) {
         try {
           recognitionRef.current.stop();
           setTimeout(() => {
@@ -1452,7 +1502,7 @@ const Chatbot = () => {
 
     const handleBlur = () => {
       // Browser lost focus - stop speech recognition to save resources
-      if (isListening && recognitionRef.current) {
+      if (isListeningRef.current && recognitionRef.current) {
         try {
           recognitionRef.current.stop();
         } catch (error) {
@@ -1468,7 +1518,7 @@ const Chatbot = () => {
       window.removeEventListener("focus", handleFocus);
       window.removeEventListener("blur", handleBlur);
     };
-  }, [isListening]);
+  }, []);
 
   return (
     <div className="chatbot-container">
@@ -1585,26 +1635,10 @@ const Chatbot = () => {
               <div className="voice-interface-content">
                 {/* Large Voice Animation */}
                 <div className="voice-animation-container">
-                  <div
-                    className={`voice-animation ${
-                      isListening
-                        ? "listening"
-                        : isSpeaking
-                        ? "speaking"
-                        : isProcessing
-                        ? "processing"
-                        : isInConversation
-                        ? "ready"
-                        : "idle"
-                    }`}
-                    style={{
-                      "--voice-level": voiceLevel,
-                      "--animation-scale": Math.max(1, voiceLevel * 2),
-                    }}
-                  >
+                  <div className={`voice-animation ${voiceState}`}>
                     <div className="voice-circle">
                       <div className="voice-icon">
-                        {isListening ? (
+                        {voiceState === "listening" ? (
                           <svg
                             width="50"
                             height="50"
@@ -1613,7 +1647,7 @@ const Chatbot = () => {
                           >
                             <path d="M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z" />
                           </svg>
-                        ) : isSpeaking ? (
+                        ) : voiceState === "speaking" ? (
                           <svg
                             width="50"
                             height="50"
@@ -1622,7 +1656,17 @@ const Chatbot = () => {
                           >
                             <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
                           </svg>
-                        ) : isProcessing ? (
+                        ) : voiceState === "processing" ? (
+                          <svg
+                            width="50"
+                            height="50"
+                            viewBox="0 0 24 24"
+                            fill="currentColor"
+                          >
+                            <circle cx="12" cy="12" r="3" />
+                            <path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 18a8 8 0 1 1 0-16 8 8 0 0 1 0 16z" />
+                          </svg>
+                        ) : voiceState === "ready" ? (
                           <svg
                             width="50"
                             height="50"
@@ -1638,13 +1682,31 @@ const Chatbot = () => {
                             viewBox="0 0 24 24"
                             fill="currentColor"
                           >
-                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" />
+                            <circle cx="12" cy="12" r="2" opacity="0.8" />
+                            <circle
+                              cx="12"
+                              cy="12"
+                              r="5"
+                              opacity="0.4"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="1.5"
+                            />
+                            <circle
+                              cx="12"
+                              cy="12"
+                              r="8"
+                              opacity="0.2"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="1"
+                            />
                           </svg>
                         )}
                       </div>
 
                       {/* Voice Level Waveform */}
-                      {isListening && (
+                      {voiceState === "listening" && (
                         <div className="voice-waveform">
                           {Array.from({ length: 8 }, (_, i) => (
                             <div
@@ -1652,7 +1714,7 @@ const Chatbot = () => {
                               className="wave-bar"
                               style={{
                                 "--delay": `${i * 0.1}s`,
-                                "--height": `${20 + voiceLevel * 40}px`,
+                                "--height": `${30 + (i % 2) * 20}px`,
                               }}
                             />
                           ))}
@@ -1666,16 +1728,16 @@ const Chatbot = () => {
                 <div className="voice-status">
                   {conversationMode === "continuous" && isInConversation ? (
                     <>
-                      {isListening && (
+                      {voiceState === "listening" && (
                         <span className="status-text">Listening...</span>
                       )}
-                      {isSpeaking && (
+                      {voiceState === "speaking" && (
                         <span className="status-text">Speaking...</span>
                       )}
-                      {isProcessing && (
+                      {voiceState === "processing" && (
                         <span className="status-text">Processing...</span>
                       )}
-                      {!isListening && !isSpeaking && !isProcessing && (
+                      {voiceState === "ready" && (
                         <span className="status-text">Ready to talk</span>
                       )}
                     </>
@@ -1698,7 +1760,17 @@ const Chatbot = () => {
                 {/* Error Display */}
                 {speechError && (
                   <div className="voice-error">
-                    <p>⚠️ {speechError}</p>
+                    <div className="error-content">
+                      <p>⚠️ {speechError}</p>
+                      {speechError.includes("already in use") && (
+                        <button
+                          className="retry-btn"
+                          onClick={startPhoneCallMode}
+                        >
+                          Retry
+                        </button>
+                      )}
+                    </div>
                   </div>
                 )}
 
