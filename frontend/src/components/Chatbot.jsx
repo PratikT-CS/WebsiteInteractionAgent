@@ -23,7 +23,7 @@ const SILENCE_PROMPTS = [
   "Are you still there?",
   "Hello? Can you hear me?",
   "I'm still here if you need any help.",
-  "Did you have any other questions?",
+  // "Did you have any other questions?",
   "Let me know if you need anything else.",
 ];
 
@@ -597,6 +597,7 @@ const Chatbot = () => {
     continuousModeRef.current = false;
     setConversationMode("manual");
     setIsInConversation(false);
+    setVoiceState("ready");
     setIsListening(false);
     isListeningRef.current = false;
     setIsProcessing(false);
